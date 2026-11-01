@@ -90,6 +90,20 @@ pub fn read_request(r: &mut impl BufRead) -> io::Result<Request> {
     })
 }
 
+/// The request body (`Content-Length` bytes, at most `limit`).
+pub fn read_body(r: &mut impl Read, req: &Request, limit: usize) -> io::Result<Vec<u8>> {
+    let len: usize = match req.header("content-length") {
+        Some(v) => v.parse().map_err(|_| invalid("bad Content-Length"))?,
+        None => 0,
+    };
+    if len > limit {
+        return Err(invalid("body too large"));
+    }
+    let mut body = vec![0; len];
+    r.read_exact(&mut body)?;
+    Ok(body)
+}
+
 /// Encodes one path segment (everything except unreserved characters).
 pub fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -195,7 +209,9 @@ pub fn reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        413 => "Content Too Large",
         416 => "Range Not Satisfiable",
+        429 => "Too Many Requests",
         503 => "Service Unavailable",
         _ => "Error",
     }
@@ -246,17 +262,45 @@ pub fn get(
     extra_headers: &[(&str, String)],
     read_timeout: Duration,
 ) -> io::Result<ClientResponse> {
+    request(addr, "GET", path, extra_headers, None, read_timeout)
+}
+
+/// `POST path` with a JSON body.
+pub fn post_json(
+    addr: SocketAddr,
+    path: &str,
+    body: &[u8],
+    read_timeout: Duration,
+) -> io::Result<ClientResponse> {
+    let headers = [("Content-Type", "application/json".to_string())];
+    request(addr, "POST", path, &headers, Some(body), read_timeout)
+}
+
+fn request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    extra_headers: &[(&str, String)],
+    body: Option<&[u8]>,
+    read_timeout: Duration,
+) -> io::Result<ClientResponse> {
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
     stream.set_read_timeout(Some(read_timeout))?;
     stream.set_write_timeout(Some(read_timeout))?;
     stream.set_nodelay(true)?;
-    let mut req =
-        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nUser-Agent: sls\r\nConnection: close\r\n");
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nUser-Agent: sls\r\nConnection: close\r\n"
+    );
     for (k, v) in extra_headers {
         req.push_str(&format!("{k}: {v}\r\n"));
     }
+    if let Some(body) = body {
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
     req.push_str("\r\n");
-    stream.write_all(req.as_bytes())?;
+    let mut out = req.into_bytes();
+    out.extend_from_slice(body.unwrap_or_default());
+    stream.write_all(&out)?;
     let mut r = BufReader::with_capacity(64 * 1024, stream);
     let lines = read_head(&mut r)?;
     let status = lines[0]
@@ -292,6 +336,20 @@ mod tests {
         assert_eq!(req.query, "x=1");
         assert_eq!(req.header("range"), Some("bytes=5-"));
         assert_eq!(r, b"BODY");
+    }
+
+    #[test]
+    fn bodies() {
+        let raw = b"POST /api/offer HTTP/1.1\r\nContent-Length: 4\r\n\r\nBODYmore";
+        let mut r = &raw[..];
+        let req = read_request(&mut r).unwrap();
+        assert_eq!(read_body(&mut r, &req, 100).unwrap(), b"BODY");
+        let mut r = &raw[..];
+        let req = read_request(&mut r).unwrap();
+        assert!(read_body(&mut r, &req, 3).is_err());
+        let mut r = &b"GET / HTTP/1.1\r\n\r\n"[..];
+        let req = read_request(&mut r).unwrap();
+        assert!(read_body(&mut r, &req, 3).unwrap().is_empty());
     }
 
     #[test]

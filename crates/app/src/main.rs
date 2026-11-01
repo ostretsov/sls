@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 mod cli;
 mod selftest;
+mod tray;
 mod ui;
 
 const HELP: &str = "\

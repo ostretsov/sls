@@ -84,7 +84,22 @@ chmod 755 "$opt/bin/sls"
 
 mkdir -p "$root/usr/bin"
 ln -s "$PREFIX/bin/sls" "$root/usr/bin/sls"
-install -Dm644 packaging/sls.desktop "$root/usr/share/applications/sls.desktop"
+# The menu entry and icon are named after the GTK application id, so GNOME
+# matches the running window to them (dock icon, "Add to Favorites").
+app_id=io.github.ostretsov.sls
+install -Dm644 packaging/$app_id.desktop "$root/usr/share/applications/$app_id.desktop"
+# The -attention variant is the tray icon while a file offer waits.
+for icon in $app_id $app_id-attention; do
+  install -Dm644 packaging/$icon.svg "$root/usr/share/icons/hicolor/scalable/apps/$icon.svg"
+  for size in 24 32 48 64 128 256; do
+    dir="$root/usr/share/icons/hicolor/${size}x$size/apps"
+    mkdir -p "$dir"
+    rsvg-convert -w $size -h $size packaging/$icon.svg -o "$dir/$icon.png"
+  done
+done
+# Not the builder's umask (group-writable on Ubuntu).
+find "$root/usr" -type d -exec chmod 755 {} +
+find "$root/usr" -type f -exec chmod 644 {} +
 install -Dm644 README.md "$root/usr/share/doc/sls/README.md"
 
 # Runtime dependencies: the system packages that own the libraries we did not
@@ -130,7 +145,7 @@ cat > "$root/DEBIAN/postinst" <<'POSTINST'
 #!/bin/sh
 set -e
 if [ "$1" = configure ] && pgrep -x sls >/dev/null 2>&1; then
-  echo "sls is running: quit it (Quit button) and start it again to use the new version."
+  echo "sls is running: quit it (top bar icon, Quit) and start it again to use the new version."
 fi
 exit 0
 POSTINST

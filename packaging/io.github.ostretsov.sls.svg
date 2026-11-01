@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- sls app icon: a folder with a network of three connected computers. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="back" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a7bd6"/>
+      <stop offset="1" stop-color="#1c5fb0"/>
+    </linearGradient>
+    <linearGradient id="front" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#62a8f5"/>
+      <stop offset="1" stop-color="#3d8be6"/>
+    </linearGradient>
+  </defs>
+  <!-- shadow -->
+  <rect x="10" y="30" width="108" height="86" rx="10" fill="#000" opacity="0.18" transform="translate(0 4)"/>
+  <!-- back of the folder with its tab -->
+  <path d="M20 18h28c3 0 5 1 7 3l6 7h47c5.5 0 10 4.5 10 10v68c0 5.5-4.5 10-10 10H20c-5.5 0-10-4.5-10-10V28c0-5.5 4.5-10 10-10z" fill="url(#back)"/>
+  <!-- paper -->
+  <rect x="18" y="34" width="92" height="40" rx="4" fill="#f6f7f9"/>
+  <!-- front -->
+  <path d="M10 50c0-5.5 4.5-10 10-10h88c5.5 0 10 4.5 10 10v56c0 5.5-4.5 10-10 10H20c-5.5 0-10-4.5-10-10z" fill="url(#front)"/>
+  <path d="M20 40h88c5.5 0 10 4.5 10 10v2c0-5.5-4.5-10-10-10H20c-5.5 0-10 4.5-10 10v-2c0-5.5 4.5-10 10-10z" fill="#fff" opacity="0.35"/>
+  <!-- network: three nodes joined by links -->
+  <g stroke="#fff" stroke-width="5" stroke-linecap="round" fill="none">
+    <path d="M64 63v20M64 83L44 99M64 83l20 16"/>
+  </g>
+  <g fill="#fff">
+    <circle cx="64" cy="62" r="9"/>
+    <circle cx="42" cy="100" r="9"/>
+    <circle cx="86" cy="100" r="9"/>
+  </g>
+  <g fill="#3d8be6">
+    <circle cx="64" cy="62" r="4"/>
+    <circle cx="42" cy="100" r="4"/>
+    <circle cx="86" cy="100" r="4"/>
+  </g>
+</svg>

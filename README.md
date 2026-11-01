@@ -16,13 +16,22 @@ servers, no addresses to type.
   takes everything below the current folder. Downloads go to your Downloads
   folder; nothing is ever overwritten (`photo (1).jpg`). **Show** opens the
   result in Files.
+* **Send someone a file.** Click the send button next to a computer under
+  **On the network** and pick a file in one of your shared folders. They get
+  *“Alice wants to send you report.pdf”* with **Accept** and **Decline**
+  (and a desktop notification); **Accept** downloads it like any other
+  download. You see their answer. Only files in shared folders can be sent,
+  because that is what the others can download anyway.
 * **Phones and computers without sls** use a web browser: the address is shown
   under your shares (e.g. `http://192.168.1.20:47300/`). Videos and music
   play directly in the browser (seeking works).
 * **Start at login.** Turn on *Start at login and keep sharing when the window
   is closed*: sls then starts without a window when you log in and keeps
-  sharing in the background. Start sls from the app menu to bring up its
-  window.
+  sharing in the background.
+* **Top bar icon.** While sls runs, its icon is in the top bar (Ubuntu's
+  AppIndicator extension, on by default). Click it to open the window; its
+  menu also has **Quit**. When someone offers you a file the icon gets an
+  orange badge until you answer. sls is also in the app menu (Activities).
 * **Your name** is what the others see (default: the computer's name).
 
 Anyone on your local network can read what you share. Don't share private
@@ -34,7 +43,7 @@ Download `sls_<version>_amd64.deb` from the
 [releases](https://github.com/ostretsov/sls/releases) and install it:
 
 ```sh
-sudo apt install ./sls_0.1.0_amd64.deb
+sudo apt install ./sls_0.2.1_amd64.deb
 ```
 
 The package is self-contained: GTK 4 and its libraries are bundled in
@@ -83,7 +92,7 @@ Needs Rust ([rustup.rs](https://rustup.rs)) and the GTK 4 headers:
 make deps      # once: build dependencies (sudo)
 make run       # try it
 make test      # tests (make test-all also tries real mDNS)
-make deb       # target/sls_0.1.0_amd64.deb (self-contained)
+make deb       # target/sls_0.2.1_amd64.deb (self-contained)
 make demo      # two instances on this machine that see each other
 make help      # everything else
 ```
@@ -109,6 +118,13 @@ few seconds, list folders with `/api/list/<share>/<path>` and download from
 `/f/<share>/<path>` (HTTP ranges supported). Requests can only reach files
 inside the shared folders: `..` is refused and symlinks leading outside a
 share are neither listed nor served.
+
+Sending a file is an offer: `POST /api/offer` names a file in one of the
+sender's shares. If the receiver accepts, it downloads the file from the
+address the offer came from, never from an address the offer names, and
+answers with `POST /api/offer-reply`. Nothing is ever written to a
+computer without the receiver accepting. At most 20 offers can wait at
+once.
 
 ## License
 

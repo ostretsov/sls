@@ -74,13 +74,19 @@ fn gui() -> anyhow::Result<()> {
     window.present();
     let display = gtk::gdk::Display::default().context("no display")?;
     let theme = gtk::IconTheme::for_display(&display);
+    let attention = format!("{}-attention", crate::ui::APP_ID);
     for icon in [
+        crate::ui::APP_ID,
+        attention.as_str(),
         "folder-symbolic",
         "folder-remote-symbolic",
         "computer-symbolic",
+        "document-send-symbolic",
     ] {
         if !theme.has_icon(icon) {
-            bail!("icon {icon} not found (is adwaita-icon-theme installed?)");
+            bail!(
+                "icon {icon} not found (is adwaita-icon-theme installed, and sls from the .deb?)"
+            );
         }
     }
     let ctx = gtk::glib::MainContext::default();

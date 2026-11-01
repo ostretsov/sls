@@ -11,8 +11,12 @@ about working on the code.
   (`http.rs`), the routes (`server.rs`), listing/downloading (`client.rs`),
   discovery (`discovery.rs`: mDNS + polling `/api/info`), autostart entry.
   Put new logic here, with unit tests.
-- `crates/app` — `ui.rs` (GTK window, background mode), `cli.rs` (`--serve`,
-  `--peers`), `selftest.rs` (`--self-test`, used by the Docker test).
+- `crates/app` — `ui.rs` (GTK window, background mode, file offers),
+  `tray.rs` (top bar icon: StatusNotifierItem + dbusmenu over GIO D-Bus, no
+  libappindicator), `cli.rs` (`--serve`, `--peers`), `selftest.rs`
+  (`--self-test`, used by the Docker test).
+- `packaging/` — the desktop entry and icons, named after the GTK app id
+  `io.github.ostretsov.sls` so GNOME matches windows to them.
 
 ## Build and test
 
@@ -31,6 +35,9 @@ about working on the code.
   done: `pkill -x sls` (not `pkill -f`, which matches your own shell).
 - Set `XDG_CONFIG_HOME` to a scratch dir before touching the "Start at login"
   switch, or it writes the user's real `~/.config/autostart/sls.desktop`.
+- Test the tray icon in a private D-Bus session too (`dbus-run-session`),
+  then inspect it with `gdbus call --dest <unique name> --object-path
+  /StatusNotifierItem …`; otherwise it shows up in the user's real top bar.
 - Look at the GUI on a private display, never the user's desktop:
   `Xvfb :77 &`, `DISPLAY=:77 sls --config-dir …`, `import -window root x.png`.
   Clicking with XTest is OK there (only there).

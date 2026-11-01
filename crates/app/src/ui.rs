@@ -16,9 +16,11 @@ use gtk::{gdk, gio, glib, pango};
 use sls_core::client::{self, Progress};
 use sls_core::config::Config;
 use sls_core::discovery::{Discovery, DiscoveryConfig, Peer};
-use sls_core::protocol::Entry;
-use sls_core::server::{Server, State};
+use sls_core::protocol::{Entry, Offer, OfferReply};
+use sls_core::server::{Incoming, Server, State};
 use sls_core::{autostart, human_size, shares};
+
+use crate::tray::Tray;
 
 pub const APP_ID: &str = "io.github.ostretsov.sls";
 
@@ -42,6 +44,19 @@ enum Ev {
         id: u64,
         result: Result<PathBuf, String>,
     },
+    /// An offer or a reply to ours arrived.
+    Incoming(Incoming),
+    OfferSent {
+        id: String,
+        result: Result<(), String>,
+    },
+}
+
+/// A file we offered, waiting for the answer.
+struct OfferOut {
+    label: gtk::Label,
+    to: String,
+    name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +109,10 @@ struct Ui {
     downloads: RefCell<HashMap<u64, DlRow>>,
     next_dl: Cell<u64>,
     chooser: RefCell<Option<gtk::FileChooserNative>>,
+    /// Offers received (shown with Accept/Decline), by offer id.
+    offers_in: RefCell<HashMap<String, gtk::Box>>,
+    offers_out: RefCell<HashMap<String, OfferOut>>,
+    tray: RefCell<Option<Tray>>,
 }
 
 pub fn run(opts: Options) -> glib::ExitCode {
@@ -118,6 +137,9 @@ pub fn run(opts: Options) -> glib::ExitCode {
         }
         return app.run_with_args(&[std::env::args().next().unwrap_or_default()]);
     }
+    // The icon installed by the .deb (X11 window icon; Wayland and the dock
+    // find it through the desktop entry named after APP_ID).
+    gtk::Window::set_default_icon_name(APP_ID);
     let background = opts.background;
     let ui = match build(&app, opts) {
         Ok(ui) => ui,
@@ -139,6 +161,7 @@ pub fn run(opts: Options) -> glib::ExitCode {
         // Say goodbye on the network.
         u.discovery.borrow_mut().take();
         u.server.borrow_mut().take();
+        u.tray.borrow_mut().take();
     });
     let argv0 = std::env::args().next().unwrap_or_else(|| "sls".into());
     app.run_with_args(&[argv0])
@@ -433,7 +456,14 @@ fn build(app: &gtk::Application, opts: Options) -> anyhow::Result<Rc<Ui>> {
         downloads: RefCell::new(HashMap::new()),
         next_dl: Cell::new(1),
         chooser: RefCell::new(None),
+        offers_in: RefCell::new(HashMap::new()),
+        offers_out: RefCell::new(HashMap::new()),
+        tray: RefCell::new(None),
     });
+    let itx = ui.tx.clone();
+    ui.state.set_inbox(Box::new(move |i| {
+        let _ = itx.send_blocking(Ev::Incoming(i));
+    }));
 
     // ---- signals
     let u = ui.clone();
@@ -530,6 +560,7 @@ fn build(app: &gtk::Application, opts: Options) -> anyhow::Result<Rc<Ui>> {
         }
     });
 
+    ui.start_tray(app);
     ui.refresh_my_list();
     ui.show_location();
     // Not the name field: typing would rename this computer by accident.
@@ -541,6 +572,55 @@ impl Ui {
     fn save(&self) {
         if let Err(e) = self.cfg.borrow().save(&self.opts.config_dir) {
             eprintln!("sls: saving settings: {e:#}");
+        }
+    }
+
+    /// The top bar icon (needs Ubuntu's AppIndicator extension, which is on
+    /// by default; elsewhere nothing shows and nothing breaks).
+    fn start_tray(&self, app: &gtk::Application) {
+        // A NON_UNIQUE app (test instances) has no connection of its own.
+        let conn = app.dbus_connection().or_else(|| {
+            gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)
+                .map_err(|e| eprintln!("sls: tray icon: {e}"))
+                .ok()
+        });
+        let Some(conn) = conn else {
+            return;
+        };
+        // Not installed (a development build): stock icons.
+        let installed = gdk::Display::default()
+            .is_some_and(|d| gtk::IconTheme::for_display(&d).has_icon(APP_ID));
+        let (icon, attention) = if installed {
+            (APP_ID.to_string(), format!("{APP_ID}-attention"))
+        } else {
+            ("folder-remote".into(), "mail-unread".into())
+        };
+        let window = self.window.downgrade();
+        let app2 = app.downgrade();
+        let tray = Tray::start(
+            &conn,
+            &icon,
+            &attention,
+            move || {
+                if let Some(w) = window.upgrade() {
+                    w.present();
+                }
+            },
+            move || {
+                if let Some(a) = app2.upgrade() {
+                    a.quit();
+                }
+            },
+        );
+        match tray {
+            Ok(t) => *self.tray.borrow_mut() = Some(t),
+            Err(e) => eprintln!("sls: tray icon: {e}"),
+        }
+    }
+
+    fn update_tray(&self) {
+        if let Some(t) = self.tray.borrow().as_ref() {
+            t.set_waiting(self.offers_in.borrow().len());
         }
     }
 
@@ -656,6 +736,9 @@ impl Ui {
             }
             Ev::DlProgress { id, progress } => self.download_progress(id, &progress),
             Ev::DlDone { id, result } => self.download_done(id, result),
+            Ev::Incoming(Incoming::Offer { offer, from }) => self.offer_received(offer, from),
+            Ev::Incoming(Incoming::Reply(r)) => self.offer_answered(r),
+            Ev::OfferSent { id, result } => self.offer_sent(&id, result),
         }
     }
 
@@ -675,6 +758,14 @@ impl Ui {
             addr.set_hexpand(true);
             addr.set_xalign(1.0);
             head.append(&addr);
+            let send = icon_button(
+                "document-send-symbolic",
+                &format!("Send {} a file from your shared folders…", p.name),
+            );
+            let u = self.clone();
+            let peer = p.clone();
+            send.connect_clicked(move |_| u.choose_file_to_send(&peer));
+            head.append(&send);
             let row = gtk::ListBoxRow::new();
             row.set_child(Some(&head));
             row.set_activatable(false);
@@ -894,8 +985,7 @@ impl Ui {
             if let Some(d) = u.downloads.borrow_mut().remove(&id) {
                 u.downloads_box.remove(&d.widget);
             }
-            u.downloads_scroll
-                .set_visible(!u.downloads.borrow().is_empty());
+            u.update_bottom();
         });
         self.downloads.borrow_mut().insert(
             id,
@@ -978,5 +1068,227 @@ impl Ui {
                 d.action.set_visible(false);
             }
         }
+    }
+
+    /// The downloads/offers area shows when it has something in it.
+    fn update_bottom(&self) {
+        self.downloads_scroll
+            .set_visible(self.downloads_box.first_child().is_some());
+    }
+
+    /// A row at the top of the downloads area; returns it and its label.
+    fn notice(self: &Rc<Self>, text: &str) -> (gtk::Box, gtk::Label) {
+        let row = hbox(6);
+        let label = gtk::Label::new(Some(text));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label.set_wrap(true);
+        label.set_wrap_mode(pango::WrapMode::WordChar);
+        row.append(&label);
+        self.downloads_box.prepend(&row);
+        self.update_bottom();
+        (row, label)
+    }
+
+    fn dismiss_button(self: &Rc<Self>, row: &gtk::Box, then: impl Fn(&Ui) + 'static) {
+        let dismiss = icon_button("window-close-symbolic", "Remove from the list");
+        let u = self.clone();
+        let r = row.clone();
+        dismiss.connect_clicked(move |_| {
+            u.downloads_box.remove(&r);
+            then(&u);
+            u.update_bottom();
+        });
+        row.append(&dismiss);
+    }
+
+    // ---- sending files to someone
+
+    fn choose_file_to_send(self: &Rc<Self>, peer: &Peer) {
+        let shares = self.state.shares();
+        let Some(first) = shares.first() else {
+            let (row, _) = self.notice(&format!(
+                "To send {} a file, first share the folder it is in: only files in your shared folders can be sent.",
+                peer.name
+            ));
+            self.dismiss_button(&row, |_| {});
+            return;
+        };
+        let dlg = gtk::FileChooserNative::new(
+            Some(&format!("Send a file to {}", peer.name)),
+            Some(&self.window),
+            gtk::FileChooserAction::Open,
+            Some("_Send"),
+            Some("_Cancel"),
+        );
+        dlg.set_modal(true);
+        let _ = dlg.set_current_folder(Some(&gio::File::for_path(&first.path)));
+        let u = self.clone();
+        let peer = peer.clone();
+        dlg.connect_response(move |d, resp| {
+            if resp == gtk::ResponseType::Accept
+                && let Some(path) = d.file().and_then(|f| f.path())
+            {
+                u.send_offer(&peer, &path);
+            }
+            u.chooser.borrow_mut().take();
+        });
+        dlg.show();
+        *self.chooser.borrow_mut() = Some(dlg);
+    }
+
+    fn send_offer(self: &Rc<Self>, peer: &Peer, path: &Path) {
+        let file_name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let Some((share, segments)) = shares::locate(&self.state.shares(), path) else {
+            let (row, _) = self.notice(&format!(
+                "“{file_name}” is not in a folder you share, so {} could not download it. Share its folder first.",
+                peer.name
+            ));
+            self.dismiss_button(&row, |_| {});
+            return;
+        };
+        let Some(port) = self.server.borrow().as_ref().map(Server::port) else {
+            return;
+        };
+        let meta = std::fs::metadata(path).ok();
+        let offer = Offer {
+            id: format!(
+                "{}{}",
+                sls_core::config::random_id(),
+                sls_core::config::random_id()
+            ),
+            from_id: self.state.id.clone(),
+            from_name: self.state.name(),
+            port,
+            share,
+            path: segments,
+            dir: meta.as_ref().is_some_and(|m| m.is_dir()),
+            size: meta.as_ref().map_or(0, |m| m.len()),
+        };
+        let name = offer.name().to_string();
+        let (widget, label) = self.notice(&format!("Offering “{name}” to {}…", peer.name));
+        let id = offer.id.clone();
+        self.dismiss_button(&widget, move |u| {
+            u.offers_out.borrow_mut().remove(&id);
+        });
+        self.offers_out.borrow_mut().insert(
+            offer.id.clone(),
+            OfferOut {
+                label,
+                to: peer.name.clone(),
+                name,
+            },
+        );
+        self.state.offer_sent(&offer.id);
+        let tx = self.tx.clone();
+        let addr = peer.addr;
+        thread::spawn(move || {
+            let result = client::send_offer(addr, &offer).map_err(|e| format!("{e:#}"));
+            let _ = tx.send_blocking(Ev::OfferSent {
+                id: offer.id,
+                result,
+            });
+        });
+    }
+
+    fn offer_sent(&self, id: &str, result: Result<(), String>) {
+        let mut out = self.offers_out.borrow_mut();
+        let Some(o) = out.get(id) else { return };
+        match result {
+            Ok(()) => o
+                .label
+                .set_text(&format!("Waiting for {} to accept “{}”…", o.to, o.name)),
+            Err(e) => {
+                o.label
+                    .set_text(&format!("✗ Could not offer “{}” to {}: {e}", o.name, o.to));
+                out.remove(id);
+            }
+        }
+    }
+
+    fn offer_answered(&self, r: OfferReply) {
+        let Some(o) = self.offers_out.borrow_mut().remove(&r.id) else {
+            return;
+        };
+        o.label.set_text(&if r.accepted {
+            format!("✓ {} accepted “{}” and is downloading it.", o.to, o.name)
+        } else {
+            format!("{} declined “{}”.", o.to, o.name)
+        });
+    }
+
+    // ---- files someone sends us
+
+    fn offer_received(self: &Rc<Self>, offer: Offer, from: SocketAddr) {
+        let name = offer.name().to_string();
+        let what = if offer.dir {
+            format!("the folder “{name}”")
+        } else {
+            format!("“{name}” ({})", human_size(offer.size))
+        };
+        let text = format!("{} wants to send you {what}.", offer.from_name);
+        let (row, _) = self.notice(&text);
+        let accept = gtk::Button::with_label("Accept");
+        accept.add_css_class("suggested-action");
+        accept.set_valign(gtk::Align::Center);
+        let decline = gtk::Button::with_label("Decline");
+        decline.set_valign(gtk::Align::Center);
+        row.append(&decline);
+        row.append(&accept);
+        self.offers_in
+            .borrow_mut()
+            .insert(offer.id.clone(), row.clone());
+        self.update_tray();
+
+        // Also outside the window (it may be hidden in the background).
+        if let Some(app) = self.window.application() {
+            let n =
+                gio::Notification::new(&format!("{} wants to send you a file", offer.from_name));
+            n.set_body(Some(&text));
+            app.send_notification(Some(&format!("offer-{}", offer.id)), &n);
+        }
+
+        // The sender's address as we saw it, never one the offer names.
+        let sender = SocketAddr::new(from.ip(), offer.port);
+        let offer = Rc::new(offer);
+        for (button, accepted) in [(&accept, true), (&decline, false)] {
+            let u = self.clone();
+            let offer = offer.clone();
+            button.connect_clicked(move |_| u.answer_offer(&offer, sender, accepted));
+        }
+    }
+
+    fn answer_offer(self: &Rc<Self>, offer: &Offer, sender: SocketAddr, accepted: bool) {
+        let Some(row) = self.offers_in.borrow_mut().remove(&offer.id) else {
+            return;
+        };
+        self.downloads_box.remove(&row);
+        self.state.offer_answered(&offer.id);
+        self.update_tray();
+        if let Some(app) = self.window.application() {
+            app.withdraw_notification(&format!("offer-{}", offer.id));
+        }
+        if accepted {
+            let loc = Location {
+                peer_id: offer.from_id.clone(),
+                peer_name: offer.from_name.clone(),
+                addr: sender,
+                share: offer.share.clone(),
+                path: vec![],
+            };
+            self.start_download(&loc, offer.path.clone(), offer.dir);
+        }
+        self.update_bottom();
+        let reply = OfferReply {
+            id: offer.id.clone(),
+            accepted,
+        };
+        thread::spawn(move || {
+            if let Err(e) = client::send_reply(sender, &reply) {
+                eprintln!("sls: answering an offer: {e:#}");
+            }
+        });
     }
 }

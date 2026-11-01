@@ -45,6 +45,28 @@ pub fn is_safe_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\0'])
 }
 
+/// The share containing `path` and the segments inside it, if any.  Paths
+/// are compared after resolving links, as the server resolves them.
+pub fn locate(shares: &[Share], path: &Path) -> Option<(String, Vec<String>)> {
+    let real = path.canonicalize().ok()?;
+    for share in shares {
+        let Ok(root) = share.path.canonicalize() else {
+            continue;
+        };
+        let Ok(rel) = real.strip_prefix(&root) else {
+            continue;
+        };
+        let segments: Option<Vec<String>> = rel
+            .components()
+            .map(|c| c.as_os_str().to_str().map(str::to_string))
+            .collect();
+        if let Some(segments) = segments.filter(|s| !s.is_empty()) {
+            return Some((share.name.clone(), segments));
+        }
+    }
+    None
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Denied {
     NotFound,
@@ -131,6 +153,24 @@ mod tests {
         ]);
         let names: Vec<_> = shares.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["Music", "Music (2)", "Files", "Music (3)"]);
+    }
+
+    #[test]
+    fn locate_in_shares() {
+        let tmp = tempfile::tempdir().unwrap();
+        let music = tmp.path().join("Music");
+        fs::create_dir_all(music.join("Album")).unwrap();
+        fs::write(music.join("Album/a.mp3"), "x").unwrap();
+        fs::write(tmp.path().join("other.txt"), "x").unwrap();
+        symlink(music.join("Album"), tmp.path().join("link")).unwrap();
+        let shares = from_paths(std::slice::from_ref(&music));
+        let want = Some(("Music".to_string(), vec!["Album".into(), "a.mp3".into()]));
+        assert_eq!(locate(&shares, &music.join("Album/a.mp3")), want);
+        assert_eq!(locate(&shares, &tmp.path().join("link/a.mp3")), want);
+        // The share itself, things outside it, and missing files are not.
+        assert_eq!(locate(&shares, &music), None);
+        assert_eq!(locate(&shares, &tmp.path().join("other.txt")), None);
+        assert_eq!(locate(&shares, &music.join("nope")), None);
     }
 
     #[test]

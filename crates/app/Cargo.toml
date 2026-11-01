@@ -1,6 +1,6 @@
 [package]
 name = "sls"
-version = "0.1.0"
+version = "0.2.1"
 description = "Simple LAN share: share folders with other computers on the local network"
 license = "MIT"
 edition = "2024"
@@ -9,7 +9,7 @@ edition = "2024"
 anyhow = "1.0.104"
 async-channel = "2.5.0"
 gtk = { version = "0.11.5", package = "gtk4", features = ["v4_6"] }
-sls-core = { version = "0.1.0", path = "../core" }
+sls-core = { version = "0.2.1", path = "../core" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

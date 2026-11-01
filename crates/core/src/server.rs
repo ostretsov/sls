@@ -1,30 +1,58 @@
-//! The web server every instance runs (read-only).
+//! The web server every instance runs (read-only: nothing can be written to
+//! the shared folders).
 //!
 //! * `/` and `/f/<share>/…/` — plain HTML pages, so phones and other computers
 //!   without sls can browse and download with a web browser
 //! * `/api/info`, `/api/list/<share>/…` — JSON for other instances
 //! * `/f/<share>/<path…>` — file contents, with `Range` support
+//! * `POST /api/offer`, `POST /api/offer-reply` — "download this from me"
+//!   offers and their answers, handed to the [`Inbox`]
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
 use crate::http::{self, Range, Request, percent_encode};
-use crate::protocol::{Info, PROTOCOL_VERSION};
-use crate::shares::{self, Denied, Share};
+use crate::protocol::{Info, Offer, OfferReply, PROTOCOL_VERSION};
+use crate::shares::{self, Denied, Share, is_safe_name};
 
 const MAX_CONNECTIONS: usize = 64;
+/// Unanswered offers kept at once (more are refused, against flooding).
+pub const MAX_PENDING_OFFERS: usize = 20;
+const MAX_BODY: usize = 64 * 1024;
+
+/// What the server receives for the app.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Incoming {
+    /// `from` is where it came from: the file is downloaded from
+    /// `from.ip()` and `offer.port`, never from an address the offer names.
+    Offer {
+        offer: Offer,
+        from: SocketAddr,
+    },
+    Reply(OfferReply),
+}
+
+/// Called on a server thread.
+pub type Inbox = Box<dyn Fn(Incoming) + Send + Sync>;
 
 /// What this instance shares; changes are visible to the next request.
 pub struct State {
     pub id: String,
     name: RwLock<String>,
     shares: RwLock<Vec<Share>>,
+    /// Without one, offers are refused (`--serve`).
+    inbox: RwLock<Option<Inbox>>,
+    /// Offers received and not answered yet.
+    pending: Mutex<HashSet<String>>,
+    /// Offers sent and not answered yet; only their replies are accepted.
+    sent: Mutex<HashSet<String>>,
 }
 
 impl State {
@@ -33,7 +61,63 @@ impl State {
             id: id.to_string(),
             name: RwLock::new(name.to_string()),
             shares: RwLock::new(shares),
+            inbox: RwLock::new(None),
+            pending: Mutex::new(HashSet::new()),
+            sent: Mutex::new(HashSet::new()),
         })
+    }
+
+    pub fn set_inbox(&self, inbox: Inbox) {
+        *self.inbox.write().unwrap() = Some(inbox);
+    }
+
+    /// Before sending an offer: its reply will be accepted.
+    pub fn offer_sent(&self, id: &str) {
+        self.sent.lock().unwrap().insert(id.to_string());
+    }
+
+    /// A received offer was accepted, declined or dropped.
+    pub fn offer_answered(&self, id: &str) {
+        self.pending.lock().unwrap().remove(id);
+    }
+
+    fn receive_offer(&self, offer: Offer, from: SocketAddr) -> Reply {
+        let valid = (1..=64).contains(&offer.id.len())
+            && offer.port != 0
+            && !offer.from_name.trim().is_empty()
+            && offer.from_name.chars().count() <= 100
+            && is_safe_name(&offer.share)
+            && !offer.path.is_empty()
+            && offer.path.iter().all(|s| is_safe_name(s));
+        if !valid {
+            return bad_request("Bad offer");
+        }
+        let inbox = self.inbox.read().unwrap();
+        let Some(inbox) = inbox.as_ref() else {
+            return Reply::Text(503, TEXT, b"This computer does not take offers\n".to_vec());
+        };
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.contains(&offer.id) {
+                return Reply::Text(200, TEXT, b"OK\n".to_vec());
+            }
+            if pending.len() >= MAX_PENDING_OFFERS {
+                return Reply::Text(429, TEXT, b"Too many offers waiting\n".to_vec());
+            }
+            pending.insert(offer.id.clone());
+        }
+        inbox(Incoming::Offer { offer, from });
+        Reply::Text(200, TEXT, b"OK\n".to_vec())
+    }
+
+    fn receive_reply(&self, reply: OfferReply) -> Reply {
+        if !self.sent.lock().unwrap().remove(&reply.id) {
+            return not_found();
+        }
+        if let Some(inbox) = self.inbox.read().unwrap().as_ref() {
+            inbox(Incoming::Reply(reply));
+        }
+        Reply::Text(200, TEXT, b"OK\n".to_vec())
     }
 
     pub fn name(&self) -> String {
@@ -160,7 +244,8 @@ fn text_reply(w: &mut impl Write, status: u16, msg: &str) -> io::Result<()> {
 fn serve_connection(state: &State, mut stream: TcpStream) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(60)))?;
-    let req = match http::read_request(&mut BufReader::new(stream.try_clone()?)) {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let req = match http::read_request(&mut reader) {
         Ok(r) => r,
         Err(e) if e.kind() == io::ErrorKind::InvalidData => {
             return text_reply(&mut stream, 400, "Bad request");
@@ -168,10 +253,18 @@ fn serve_connection(state: &State, mut stream: TcpStream) -> io::Result<()> {
         Err(e) => return Err(e),
     };
     let head_only = req.method == "HEAD";
-    if req.method != "GET" && !head_only {
-        return text_reply(&mut stream, 405, "Only GET is supported");
-    }
-    match route(state, &req) {
+    let reply = match req.method.as_str() {
+        "GET" | "HEAD" => route(state, &req),
+        "POST" => match http::read_body(&mut reader, &req, MAX_BODY) {
+            Ok(body) => post_route(state, &req, &body, stream.peer_addr()?),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                return text_reply(&mut stream, 413, "Request too large");
+            }
+            Err(e) => return Err(e),
+        },
+        _ => return text_reply(&mut stream, 405, "Method not allowed"),
+    };
+    match reply {
         Reply::Text(status, ctype, body) => {
             http::write_head(
                 &mut stream,
@@ -231,6 +324,26 @@ fn send_file(
     file.seek(io::SeekFrom::Start(start))?;
     io::copy(&mut file.take(count), stream)?;
     Ok(())
+}
+
+const TEXT: &str = "text/plain; charset=utf-8";
+
+fn bad_request(msg: &str) -> Reply {
+    Reply::Text(400, TEXT, format!("{msg}\n").into_bytes())
+}
+
+fn post_route(state: &State, req: &Request, body: &[u8], from: SocketAddr) -> Reply {
+    match req.path.as_str() {
+        "/api/offer" => match serde_json::from_slice(body) {
+            Ok(offer) => state.receive_offer(offer, from),
+            Err(_) => bad_request("Bad offer"),
+        },
+        "/api/offer-reply" => match serde_json::from_slice(body) {
+            Ok(reply) => state.receive_reply(reply),
+            Err(_) => bad_request("Bad reply"),
+        },
+        _ => Reply::Text(405, TEXT, b"Method not allowed\n".to_vec()),
+    }
 }
 
 fn denied(d: Denied) -> Reply {
@@ -540,6 +653,11 @@ mod tests {
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, server.port()));
         for (raw, expect) in [
             (&b"POST / HTTP/1.1\r\n\r\n"[..], "405"),
+            (&b"PUT / HTTP/1.1\r\n\r\n"[..], "405"),
+            (
+                &b"POST /api/offer HTTP/1.1\r\nContent-Length: 999999\r\n\r\n"[..],
+                "413",
+            ),
             (&b"nonsense\r\n\r\n"[..], "400"),
         ] {
             let mut s = TcpStream::connect(addr).unwrap();
@@ -548,5 +666,99 @@ mod tests {
             s.read_to_string(&mut out).unwrap();
             assert!(out.starts_with(&format!("HTTP/1.1 {expect}")), "{out}");
         }
+    }
+
+    fn offer(id: &str) -> Offer {
+        Offer {
+            id: id.into(),
+            from_id: "f".into(),
+            from_name: "Alice".into(),
+            port: 4000,
+            share: "Music".into(),
+            path: vec!["Album".into(), "a.mp3".into()],
+            dir: false,
+            size: 3,
+        }
+    }
+
+    fn post(server: &Server, path: &str, body: &impl serde::Serialize) -> u16 {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, server.port()));
+        let body = serde_json::to_vec(body).unwrap();
+        http::post_json(addr, path, &body, Duration::from_secs(5))
+            .unwrap()
+            .status
+    }
+
+    #[test]
+    fn offers() {
+        let (_tmp, state, server) = setup();
+        // No inbox (no window): refused.
+        assert_eq!(post(&server, "/api/offer", &offer("1")), 503);
+
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let got2 = got.clone();
+        state.set_inbox(Box::new(move |i| got2.lock().unwrap().push(i)));
+        assert_eq!(post(&server, "/api/offer", &offer("1")), 200);
+        // The same again is not shown twice.
+        assert_eq!(post(&server, "/api/offer", &offer("1")), 200);
+        match &got.lock().unwrap()[..] {
+            [Incoming::Offer { offer: o, from }] => {
+                assert_eq!(o, &offer("1"));
+                assert_eq!(from.ip(), Ipv4Addr::LOCALHOST);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        for bad in [
+            Offer {
+                path: vec!["..".into()],
+                ..offer("2")
+            },
+            Offer {
+                path: vec![],
+                ..offer("2")
+            },
+            Offer {
+                share: "a/b".into(),
+                ..offer("2")
+            },
+            Offer {
+                from_name: " ".into(),
+                ..offer("2")
+            },
+            Offer {
+                id: "x".repeat(65),
+                ..offer("2")
+            },
+        ] {
+            assert_eq!(post(&server, "/api/offer", &bad), 400, "{bad:?}");
+        }
+        assert_eq!(post(&server, "/api/offer", &"nonsense"), 400);
+
+        // Flooding stops at MAX_PENDING_OFFERS; answering frees a slot.
+        for i in 2..=MAX_PENDING_OFFERS {
+            assert_eq!(post(&server, "/api/offer", &offer(&i.to_string())), 200);
+        }
+        assert_eq!(post(&server, "/api/offer", &offer("x")), 429);
+        state.offer_answered("1");
+        assert_eq!(post(&server, "/api/offer", &offer("x")), 200);
+    }
+
+    #[test]
+    fn offer_replies() {
+        let (_tmp, state, server) = setup();
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let got2 = got.clone();
+        state.set_inbox(Box::new(move |i| got2.lock().unwrap().push(i)));
+        let reply = OfferReply {
+            id: "7".into(),
+            accepted: true,
+        };
+        // Only for offers this instance sent, and only once.
+        assert_eq!(post(&server, "/api/offer-reply", &reply), 404);
+        state.offer_sent("7");
+        assert_eq!(post(&server, "/api/offer-reply", &reply), 200);
+        assert_eq!(post(&server, "/api/offer-reply", &reply), 404);
+        assert_eq!(*got.lock().unwrap(), [Incoming::Reply(reply)]);
     }
 }

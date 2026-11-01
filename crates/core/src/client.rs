@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, anyhow, bail};
 
 use crate::http;
-use crate::protocol::{Entry, Info};
+use crate::protocol::{Entry, Info, Offer, OfferReply};
 use crate::shares::is_safe_name;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -40,6 +40,31 @@ fn segments<'a>(share: &'a str, path: &'a [String]) -> Vec<&'a str> {
     std::iter::once(share)
         .chain(path.iter().map(String::as_str))
         .collect()
+}
+
+fn json_post(addr: SocketAddr, path: &str, value: &impl serde::Serialize) -> anyhow::Result<()> {
+    let body = serde_json::to_vec(value)?;
+    let resp = http::post_json(addr, path, &body, Duration::from_secs(10))?;
+    let status = resp.status;
+    let body = resp.read_all(1 << 16).unwrap_or_default();
+    match status {
+        200 => Ok(()),
+        // Older versions only know GET.
+        405 => bail!("its sls is too old to receive files"),
+        503 => bail!("it runs without a window and cannot be asked"),
+        429 => bail!("too many offers are waiting for an answer there"),
+        _ => bail!("{} ({status})", String::from_utf8_lossy(&body).trim()),
+    }
+}
+
+/// Asks the instance at `addr` to download `offer` from us.
+pub fn send_offer(addr: SocketAddr, offer: &Offer) -> anyhow::Result<()> {
+    json_post(addr, "/api/offer", offer)
+}
+
+/// Tells the sender (at its address and `offer.port`) the answer.
+pub fn send_reply(addr: SocketAddr, reply: &OfferReply) -> anyhow::Result<()> {
+    json_post(addr, "/api/offer-reply", reply)
 }
 
 /// The contents of `path` (segments) inside `share`.

@@ -23,7 +23,7 @@ pub fn entry(exec: &str, config_dir: Option<&Path>) -> String {
     format!(
         "[Desktop Entry]\nType=Application\nName=sls\n\
          Comment=Share folders on the local network (started in the background)\n\
-         Exec={cmd}\nIcon=folder-remote\nTerminal=false\nNoDisplay=true\n\
+         Exec={cmd}\nIcon=io.github.ostretsov.sls\nTerminal=false\nNoDisplay=true\n\
          X-GNOME-Autostart-enabled=true\n"
     )
 }
