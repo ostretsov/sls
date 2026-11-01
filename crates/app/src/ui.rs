@@ -396,9 +396,6 @@ fn build(app: &gtk::Application, opts: Options) -> anyhow::Result<Rc<Ui>> {
     paned.set_shrink_end_child(false);
 
     let header = gtk::HeaderBar::new();
-    let quit = gtk::Button::with_label("Quit");
-    quit.set_tooltip_text(Some("Stop sharing and close sls"));
-    header.pack_end(&quit);
 
     let window = gtk::ApplicationWindow::builder()
         .application(app)
@@ -456,12 +453,6 @@ fn build(app: &gtk::Application, opts: Options) -> anyhow::Result<Rc<Ui>> {
     bg_switch.connect_state_set(move |_, on| {
         u.set_background(on);
         glib::Propagation::Proceed
-    });
-    let u = ui.clone();
-    quit.connect_clicked(move |_| {
-        if let Some(app) = u.window.application() {
-            app.quit();
-        }
     });
     let u = ui.clone();
     ui.net_list.connect_row_activated(move |_, row| {

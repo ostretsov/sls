@@ -22,7 +22,7 @@ servers, no addresses to type.
 * **Start at login.** Turn on *Start at login and keep sharing when the window
   is closed*: sls then starts without a window when you log in and keeps
   sharing in the background. Start sls from the app menu to bring up its
-  window. **Quit** stops it completely.
+  window.
 * **Your name** is what the others see (default: the computer's name).
 
 Anyone on your local network can read what you share. Don't share private
