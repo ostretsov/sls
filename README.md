@@ -43,7 +43,7 @@ Download `sls_<version>_amd64.deb` from the
 [releases](https://github.com/ostretsov/sls/releases) and install it:
 
 ```sh
-sudo apt install ./sls_0.2.1_amd64.deb
+sudo apt install ./sls_0.2.0_amd64.deb
 ```
 
 The package is self-contained: GTK 4 and its libraries are bundled in
@@ -92,7 +92,7 @@ Needs Rust ([rustup.rs](https://rustup.rs)) and the GTK 4 headers:
 make deps      # once: build dependencies (sudo)
 make run       # try it
 make test      # tests (make test-all also tries real mDNS)
-make deb       # target/sls_0.2.1_amd64.deb (self-contained)
+make deb       # target/sls_0.2.0_amd64.deb (self-contained)
 make demo      # two instances on this machine that see each other
 make help      # everything else
 ```
