@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=sls
+GenericName=LAN folder sharing
+Comment=Share folders with the other computers on your local network
+Exec=sls
+Icon=folder-remote
+Terminal=false
+Categories=Network;FileTransfer;Utility;
+Keywords=share;lan;network;files;folder;
